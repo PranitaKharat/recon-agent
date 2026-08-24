@@ -6055,6 +6055,57 @@ def execute_scan(target, zombie_ip=None, custom_ports=None):
 
 # Replace the existing main block at the bottom of file.py with this:
 
+def sanitize_target(target_input):
+    """Accepts whatever a person actually types - a bare IP, a bare hostname,
+    or a full pasted URL like 'https://www.ferrari.com/en-IN' - and reduces
+    it to the one thing Scapy's IP(dst=...) can actually use: a hostname or
+    IP address, nothing else.
+
+    Why this was breaking before: Scapy's IP field treats its input as
+    either a literal IP or a 'Net' (CIDR-style, e.g. '192.168.1.0/24') when
+    it isn't a plain dotted-quad. A pasted URL like
+    'https://www.ferrari.com/en-IN' has no special handling at that layer at
+    all - Scapy has no concept of a URL scheme or a path, only a
+    destination address - so it got handed the entire string, saw a '/',
+    assumed CIDR notation, tried to int() the part after the slash
+    ('www.ferrari.com/en-IN'), and crashed with exactly the ValueError seen
+    in the traceback. This function does that stripping up front instead of
+    leaving Scapy to misinterpret it.
+
+    Also resolves a hostname to its IP via DNS - Scapy accepts bare
+    hostnames as well as IPs in practice, but resolving explicitly here
+    means the *rest* of this tool (which builds raw filenames, log lines,
+    etc. from target_ip) always gets a clean, printable IP rather than
+    whatever hostname formatting the person happened to type."""
+    target_input = target_input.strip()
+    if not target_input:
+        raise ValueError("Target cannot be empty.")
+
+    # Add a scheme if none was given, purely so urlparse treats it as a URL
+    # and populates .hostname correctly instead of treating the whole string
+    # as an opaque path (urlparse('example.com') does NOT extract a hostname
+    # without a scheme present).
+    parseable = target_input if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', target_input) else f"//{target_input}"
+    parsed = urlparse(parseable, scheme="http")
+    clean_host = parsed.hostname
+
+    if not clean_host:
+        raise ValueError(f"Could not extract a hostname or IP from '{target_input}'.")
+
+    try:
+        resolved_ip = socket.gethostbyname(clean_host)
+        if resolved_ip != clean_host:
+            print(f"[*] Resolved '{clean_host}' -> {resolved_ip}")
+        return resolved_ip
+    except socket.gaierror:
+        # Not DNS-resolvable - if it was already a literal IP this is a
+        # no-op path (gethostbyname on a valid IP just returns it, so we
+        # would not even reach here); if it's a genuinely bad hostname,
+        # hand it back as-is and let the actual scan fail with a clear
+        # connection error rather than masking the problem here.
+        return clean_host
+
+
 def _parse_port_spec(spec):
     """Parses a user-supplied port spec into a list of ints - accepts a
     single port ('8080'), a comma list ('22,80,8080'), or a hyphen range
@@ -6083,37 +6134,6 @@ def _parse_port_spec(spec):
             ports.append(p)
     return ports
 
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        target_host = sys.argv[1]
-        zombie_host = sys.argv[2] if len(sys.argv) > 2 else None
-        port_spec = sys.argv[3] if len(sys.argv) > 3 else None
-    else:
-        target_host = input("[?] Enter Target IP Address to scan: ").strip()
-        zombie_prompt = input("[?] Enter Zombie Host IP for Idle Scan (Press Enter to Skip): ").strip()
-        zombie_host = zombie_prompt if zombie_prompt else None
-        port_spec = input("[?] Enter specific port(s) to scan, e.g. '8080' or '22,80,8080' or '8000-8010' "
-                           "(Press Enter to scan the full default port list): ").strip()
-
-    if not target_host:
-        print("[!] Target IP is required. Exiting.")
-        sys.exit(1)
-
-    try:
-        custom_port_list = _parse_port_spec(port_spec)
-    except ValueError as e:
-        print(f"[!] {e}")
-        sys.exit(1)
-
-    results = execute_scan(target_host, zombie_host, custom_ports=custom_port_list)
-
-    # Output file generation
-    output_filename = f"scan_results_{target_host}.json"
-    with open(output_filename, "w") as f:
-        json.dump(results, f, indent=4)
-           
-    # Save output to JSON file
 
 # ==============================================================================
 # REPORT GENERATION ENGINES (JSON, TXT, XML)
@@ -6274,11 +6294,34 @@ def save_reports(target_ip, scan_data):
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Ensure target_ip is configured
-    target_host = scan_results.get("target_ip", "192.168.56.105")
-    if not target_host:
-        target_host = "192.168.56.105"
-        scan_results["target_ip"] = target_host
-        
+    if len(sys.argv) >= 2:
+        raw_target = sys.argv[1]
+        zombie_host = sys.argv[2] if len(sys.argv) > 2 else None
+        port_spec = sys.argv[3] if len(sys.argv) > 3 else None
+    else:
+        raw_target = input("[?] Enter Target IP Address to scan: ").strip()
+        zombie_prompt = input("[?] Enter Zombie Host IP for Idle Scan (Press Enter to Skip): ").strip()
+        zombie_host = zombie_prompt if zombie_prompt else None
+        port_spec = input("[?] Enter specific port(s) to scan, e.g. '8080' or '22,80,8080' or '8000-8010' "
+                           "(Press Enter to scan the full default port list): ").strip()
+
+    if not raw_target:
+        print("[!] Target IP is required. Exiting.")
+        sys.exit(1)
+
+    try:
+        target_host = sanitize_target(raw_target)
+    except ValueError as e:
+        print(f"[!] Invalid target: {e}")
+        sys.exit(1)
+
+    try:
+        custom_port_list = _parse_port_spec(port_spec)
+    except ValueError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
+
+    results = execute_scan(target_host, zombie_host, custom_ports=custom_port_list)
+
     # Execution completed, trigger report generation pipeline
-    save_reports(target_host, scan_results)
+    save_reports(target_host, results)
