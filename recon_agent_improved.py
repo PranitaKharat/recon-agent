@@ -152,6 +152,24 @@ scan_results = {
         "11211": {"service": "Memcached", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
         "111": {"service": "RPCBind", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
         "2049": {"service": "NFS", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        # Classic Unix/legacy ports - notably the exact set nmap's full -p-
+        # sweep found open on Metasploitable2 that the original ~67-port
+        # default list didn't cover, including two of its most well-known
+        # backdoor/RCE vectors (1524 ingreslock, 3632 distccd).
+        "139": {"service": "NetBIOS-SSN", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "512": {"service": "exec (rexecd)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "513": {"service": "login (rlogind)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "514": {"service": "shell (rshd)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "1099": {"service": "Java-RMI-Registry", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "1524": {"service": "ingreslock (classic Metasploitable backdoor port)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "2121": {"service": "FTP-Alt", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "3632": {"service": "distcc (distccd)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "6000": {"service": "X11", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "6667": {"service": "IRC", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "6697": {"service": "IRC-SSL", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "8009": {"service": "AJP13", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "8180": {"service": "HTTP-Alt (Tomcat)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
+        "8787": {"service": "DRb (Distributed Ruby)", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
         # TIER 2 NEW PORTS IN SCAN RESULTS
         "9042": {"service": "Cassandra-CQL", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
         "5984": {"service": "CouchDB", "version": "Not Evaluated", "scans": {}, "enumeration": {}},
@@ -3468,17 +3486,21 @@ def run_ftps_advanced_audit(target):
 COMMON_PORT_SERVICE_GUESS = {
     20: "FTP-Data", 37: "Time", 79: "Finger", 113: "Ident", 119: "NNTP",
     139: "NetBIOS-SSN", 179: "BGP", 194: "IRC", 220: "IMAP3", 500: "IKE/ISAKMP",
-    514: "Syslog", 515: "LPD/Printer", 520: "RIP", 546: "DHCPv6-Client",
+    512: "exec (rexecd)", 513: "login (rlogind)", 514: "shell (rshd) [TCP] / Syslog [UDP]",
+    515: "LPD/Printer", 520: "RIP", 546: "DHCPv6-Client",
     547: "DHCPv6-Server", 554: "RTSP", 587: "SMTP-Submission", 623: "IPMI",
-    902: "VMware-Auth", 1080: "SOCKS", 1194: "OpenVPN", 1723: "PPTP",
-    2222: "SSH-Alt", 3128: "HTTP-Proxy", 3690: "SVN", 4444: "Metasploit/Generic",
-    4567: "Generic-App", 4848: "GlassFish-Admin", 5000: "UPnP/Flask-Dev",
-    5222: "XMPP", 5353: "mDNS", 5555: "ADB/Android-Debug", 5666: "NRPE",
-    6000: "X11", 6666: "IRC-Alt", 7000: "Generic-App", 7001: "WebLogic",
-    7777: "Generic-App", 8000: "HTTP-Alt", 8081: "HTTP-Proxy-Alt",
-    8161: "ActiveMQ-Admin", 8888: "HTTP-Alt", 9000: "PHP-FPM/SonarQube",
-    9999: "Generic-App", 10000: "Webmin", 27018: "MongoDB-Shard",
-    28017: "MongoDB-HTTP-Status",
+    902: "VMware-Auth", 1080: "SOCKS", 1099: "Java-RMI-Registry", 1194: "OpenVPN",
+    1524: "ingreslock (classic Metasploitable backdoor port)", 1723: "PPTP",
+    2121: "FTP-Alt (e.g. ProFTPD)", 2222: "SSH-Alt", 3128: "HTTP-Proxy",
+    3632: "distcc (distccd - CVE-2004-2687 RCE)", 3690: "SVN",
+    4444: "Metasploit/Generic", 4567: "Generic-App", 4848: "GlassFish-Admin",
+    5000: "UPnP/Flask-Dev", 5222: "XMPP", 5353: "mDNS", 5555: "ADB/Android-Debug",
+    5666: "NRPE", 6000: "X11", 6666: "IRC-Alt", 6667: "IRC", 6697: "IRC-SSL",
+    7000: "Generic-App", 7001: "WebLogic", 7777: "Generic-App", 8000: "HTTP-Alt",
+    8009: "AJP13 (Tomcat - CVE-2020-1938 Ghostcat)", 8081: "HTTP-Proxy-Alt",
+    8161: "ActiveMQ-Admin", 8180: "HTTP-Alt (Tomcat default)", 8787: "DRb (Distributed Ruby)",
+    8888: "HTTP-Alt", 9000: "PHP-FPM/SonarQube", 9999: "Generic-App",
+    10000: "Webmin", 27018: "MongoDB-Shard", 28017: "MongoDB-HTTP-Status",
 }
 
 def _ensure_port_template(port):
@@ -4334,6 +4356,163 @@ def _parse_mongo_version(raw):
         return decoded if re.match(r'^\d+\.\d+', decoded) else None
     except Exception:
         return None
+
+# ==============================================================================
+# BERKELEY r-COMMANDS MODULE: exec (512) and shell (514) - safe identification
+# only, never rlogin (513) actively (see note below on why that one is skipped).
+# ==============================================================================
+def _rcmd_probe(target, port, timeout, fields):
+    """Sends a null-terminated field sequence per the rexec/rsh wire format
+    and returns whatever the daemon replies with. `fields` is the ordered
+    list of ASCII fields (stderr-port, username(s), command) - the caller is
+    responsible for making the command field a safe no-op (see below)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((target, port))
+        payload = b"".join(f.encode() + b"\x00" for f in fields)
+        s.sendall(payload)
+        try:
+            data = s.recv(1024)
+        except socket.timeout:
+            data = b""
+        s.close()
+        return data
+    except Exception:
+        return b""
+
+def run_rexec_family_audit(target, port):
+    """exec (512, rexecd) and shell (514, rshd) don't send an unsolicited
+    banner on connect - unlike FTP/SSH/SMTP, the daemon just waits for the
+    client to speak first. Identification requires actually sending a
+    (safe, inert) request:
+
+    - rexecd (512) wire format: <stderr-port>\\0 <username>\\0 <password>\\0 <command>\\0
+    - rshd   (514) wire format: <stderr-port>\\0 <local-user>\\0 <remote-user>\\0 <command>\\0
+
+    Both are sent with an EMPTY username (guarantees auth failure on any real
+    system) and 'echo' as the command field - a command that does nothing
+    even in the vanishingly unlikely case authentication unexpectedly
+    succeeds. This mirrors how real audit tooling probes these legacy
+    protocols: you cannot get an identifying response without completing a
+    request, so the request is engineered to be a safe no-op regardless of
+    outcome, rather than skipped entirely.
+
+    rlogin (513, login) is deliberately NOT probed this way: unlike rexec's
+    password auth or rsh's read-only .rhosts trust check ahead of a no-op
+    command, completing the rlogin handshake can itself establish a real,
+    interactive trusted session if the target's .rhosts trusts the scanning
+    host - that's a materially different risk (an actual login, not just an
+    auth-failure diagnostic) and this tool does not attempt it. Port 513
+    still gets whatever the generic passive banner-grab fallback finds."""
+    timeout = get_dynamic_timeout()
+    label = "exec (rexecd)" if port == 512 else "shell (rshd)"
+    log_and_print("enumeration", "rcmd_init", f"[*] Auditing {label} on {target}:{port} (safe no-op identification probe)", port=port)
+
+    if port == 512:
+        fields = ["0", "", "", "echo"]      # stderr-port, username, password, command
+    else:
+        fields = ["0", "", "", "echo"]      # stderr-port, local-user, remote-user, command
+
+    raw = _rcmd_probe(target, port, timeout, fields)
+    if raw:
+        printable = re.sub(rb'[^\x20-\x7e\r\n]', b'.', raw[:300]).decode('ascii', errors='ignore').strip()
+        if printable:
+            scan_results["port_scans"][str(port)]["version"] = f"{label} - daemon response: {printable}"
+            log_and_print("enumeration", "rcmd_response", f"  [+] {label} responded: {printable[:150]}", port=port)
+            return
+    scan_results["port_scans"][str(port)]["version"] = f"{label} - port active, no identifying response to no-op probe"
+    log_and_print("enumeration", "rcmd_no_response", f"  [-] {label}: no response captured (daemon likely closed the connection after the auth check failed, as expected)", port=port)
+
+
+# ==============================================================================
+# IRC AUDIT MODULE: NICK/USER registration + VERSION probe. IRC daemons don't
+# volunteer their version on connect - unlike FTP/SSH/SMTP, the exact
+# software build only comes out once a client actually registers. This is
+# exactly how nmap's own version detection gets 'Unreal3.2.8.1' instead of
+# just 'IRC service active'.
+# ==============================================================================
+def _parse_irc_version(raw_text):
+    """RPL_MYINFO (numeric 004) is the standard place every IRC daemon
+    (UnrealIRCd, InspIRCd, ircd-hybrid, ngIRCd...) states its own version,
+    right after registration succeeds - format per RFC 2812:
+    ':server 004 nick server version usermodes chanmodes [...]'
+    so the version is always the 5th whitespace-separated token. Falls back
+    to RPL_VERSION (numeric 351), the direct reply to an explicit VERSION
+    command, in case a daemon omits it from 004."""
+    for line in raw_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1] == "004":
+            return parts[4]
+    for line in raw_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == "351":
+            return parts[3]
+    return None
+
+def run_irc_advanced_audit(target, port):
+    timeout = get_dynamic_timeout()
+    log_and_print("enumeration", "irc_init", f"[*] Auditing IRC Service on {target}:{port} (NICK/USER registration + VERSION probe)", port=port)
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        if port == 6697:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(raw_sock, server_hostname=target)
+        else:
+            sock = raw_sock
+        sock.connect((target, port))
+
+        nick = f"recon{os.urandom(2).hex()}"
+        sock.sendall(f"NICK {nick}\r\nUSER {nick} 0 * :ReconAgent\r\n".encode())
+
+        # Registration replies (numerics 001-004, MOTD 372-376) commonly
+        # arrive across several TCP segments - accumulate for a short window
+        # rather than trusting a single recv() to have it all.
+        buf = b""
+        sock.settimeout(2)
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if b" 004 " in buf or len(buf) > 8192:
+                    break
+        except socket.timeout:
+            pass
+
+        sock.sendall(b"VERSION\r\n")
+        try:
+            sock.settimeout(timeout)
+            buf += sock.recv(4096)
+        except socket.timeout:
+            pass
+
+        try:
+            sock.sendall(f"QUIT :{nick} done\r\n".encode())
+        except Exception:
+            pass
+        sock.close()
+
+        text = buf.decode('utf-8', errors='ignore')
+        version = _parse_irc_version(text)
+        if version:
+            scan_results["port_scans"][str(port)]["version"] = f"IRCd version: {version}"
+            log_and_print("enumeration", "irc_version", f"  [+] IRC daemon version: {version}", port=port)
+        else:
+            server_name_match = re.search(r'^:(\S+)\s+00[1-4]', text, re.MULTILINE)
+            if server_name_match:
+                scan_results["port_scans"][str(port)]["version"] = f"IRC server active ({server_name_match.group(1)}) - version string not found in registration reply"
+                log_and_print("enumeration", "irc_no_version", "  [-] IRC server registered successfully but no version string was found in the 004/351 replies", port=port)
+            else:
+                scan_results["port_scans"][str(port)]["version"] = "IRC port active - no registration reply captured"
+                log_and_print("enumeration", "irc_no_reply", "  [-] No registration reply captured from IRC service", port=port)
+    except Exception as e:
+        log_and_print("enumeration", "irc_fault", f"  [-] IRC Audit Exception: {e}", port=port)
+
 
 def run_mongodb_advanced_audit(target):
     timeout = get_dynamic_timeout()
@@ -5323,7 +5502,7 @@ _PRODUCT_NAME_PATTERNS = [
     r'\b(Samba)\b', r'\b(BIND|ISC BIND)\b', r'\b(dnsmasq)\b', r'\b(OpenSSL)\b',
     r'\b(WordPress)\b', r'\b(Jenkins)\b', r'\b(Grafana)\b', r'\b(Prometheus)\b',
     r'\b(Kibana)\b', r'\b(Elasticsearch)\b', r'\b(RabbitMQ)\b', r'\b(Memcached)\b',
-    r'\b(OpenLDAP)\b', r'\b(RPCBind)\b', r'\b(NFS)\b',
+    r'\b(OpenLDAP)\b', r'\b(RPCBind)\b', r'\b(NFS)\b', r'\b(Unreal)\d',
 ]
 
 def _extract_product_name(service_name, version_text):
@@ -5336,7 +5515,7 @@ def _extract_product_name(service_name, version_text):
     for pattern in _PRODUCT_NAME_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            return m.group(1)
+            return "UnrealIRCd" if m.group(1) == "Unreal" else m.group(1)
     return service_name.strip()
 
 # Maps the specific product names above to their NVD CPE 2.3 vendor:product
@@ -5377,8 +5556,8 @@ _CPE_VENDOR_PRODUCT_MAP = {
     "Elasticsearch": "elastic:elasticsearch",
     "Memcached": "memcached:memcached",
     "OpenLDAP": "openldap:openldap",
+    "UnrealIRCd": "unrealircd:unrealircd",
 }
-
 # Services whose wire protocol only ever discloses a PROTOCOL version (NFSv3,
 # NFSv4, RPC version 2...) rather than a software package version - there is
 # no clean "X.Y" release number to build a CPE virtualMatchString from, ever,
@@ -5472,6 +5651,17 @@ def extract_clean_version(service_name, version_text):
     # accidentally grabbing a leading protocol-version number (e.g. the "2.0" in
     # "SSH-2.0-OpenSSH_8.9p1" is the SSH protocol version, not the software version).
     cue_match = _first_non_protocol_match(r'[_/](\d{1,3}\.\d{1,3}(?:\.\d{1,4})?(?:[a-zA-Z]?\d*)?)', version_text)
+    if not cue_match:
+        # Priority 1.5: version concatenated directly onto the product name with
+        # no separator at all, e.g. 'Unreal3.2.8.1' (UnrealIRCd's own self-reported
+        # RPL_MYINFO string). Plain \b-boundary matching (priority 3 below) cannot
+        # see this correctly: there's no \w-boundary between a letter and a digit,
+        # but there IS one between the first '.' and the next digit, so a bare
+        # \b\d...\b scan skips straight past the leading version component and
+        # grabs a truncated, WRONG version (e.g. '2.8.1' instead of '3.2.8.1') -
+        # silently querying CVEs for the wrong release rather than just missing.
+        # Anchoring explicitly on the letter-to-digit transition fixes that.
+        cue_match = _first_non_protocol_match(r'[A-Za-z](\d{1,3}(?:\.\d{1,3}){1,3})', version_text)
     if not cue_match:
         # Priority 2: an explicit "version"/"v"/"build"/"release" cue anywhere in the text
         cue_match = _first_non_protocol_match(r'(?:version|ver|build|release)[\s:]*v?(\d{1,3}\.\d{1,3}(?:\.\d{1,4})?)', version_text, re.IGNORECASE)
@@ -5994,6 +6184,10 @@ def execute_scan(target, zombie_ip=None, custom_ports=None):
                 run_redis_advanced_audit(target)
             elif port == MONGODB_PORT:
                 run_mongodb_advanced_audit(target)
+            elif port in [512, 514]:
+                run_rexec_family_audit(target, port)
+            elif port in [6667, 6697]:
+                run_irc_advanced_audit(target, port)
             elif port == 9042:
                 run_cassandra_advanced_audit(target)
             elif port == 5984:
